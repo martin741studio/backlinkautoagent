@@ -43,12 +43,15 @@ def run_apollo_enrichment(targets):
 
     for p in targets:
         domain = p.get("Domain", "")
-        verdict = p.get("verdict", "")
+        verdict = p.get("Verdict", p.get("verdict", ""))
         
+        if p.get("Contact") is None:
+            p["Contact"] = ""
+
         # Maps pipeline 'Contact' mapping which aligns to Column E
-        existing_email = p.get("Contact", "").strip() 
+        existing_email = (p.get("Contact") or "").strip() 
         if not existing_email and p.get("Email"):
-            existing_email = p.get("Email", "").strip()
+            existing_email = (p.get("Email") or "").strip()
 
         # Resets Tracking
         p["_apollo_attempted"] = False
@@ -88,61 +91,64 @@ def run_apollo_enrichment(targets):
         logging.info(f"   -> Pinging Apollo API for highly qualified target: {domain}...")
         p["_apollo_attempted"] = True
         
-        url = "https://api.apollo.io/v1/mixed_people/search"
+        url = "https://api.apollo.io/api/v1/mixed_people/search"
         headers = {
+            "Content-Type": "application/json",
             "Cache-Control": "no-cache",
-            "Content-Type": "application/json" # explicitly json
+            "X-Api-Key": api_key
         }
         
         payload = {
-            "api_key": api_key,
-            "q_organization_domains": [domain],
-            "page": 1
+            "q_organization_domains_list": [domain],
+            "person_seniorities": ["owner", "founder", "c_suite"],
+            "contact_email_status": ["verified"],
+            "per_page": 3
         }
+        
+        logging.info(f"      -> Apollo Payload: {payload}")
         
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=20)
-            response.raise_for_status()
-            data = response.json()
+            logging.info(f"      -> Apollo Status: {response.status_code}")
             
-            people = data.get("people", [])
-            found_email = None
-            
-            # Email Selection Logic (Evaluate against roles)
-            for person in people:
-                email = person.get("email")
-                title = person.get("title", "")
+            if response.status_code == 200:
+                data = response.json()
+                people = data.get("people", [])
+                found_email = None
                 
-                # Guard rails for generic empty titles
-                if not title:
-                    title = ""
-                title = title.lower()
-                
-                if email and any(role in title for role in valid_roles):
-                    found_email = email
-                    logging.info(f"      -> Success! Found validated decision-maker email: {found_email} ({title})")
-                    break
-                    
-            if found_email:
-                if existing_email:
-                    if found_email not in existing_email:
-                        p["Contact"] = f"{existing_email}, {found_email}"
+                if people:
+                    for person in people:
+                        # Extract email ONLY if has_email is True
+                        if person.get("has_email") == True and person.get("email"):
+                            found_email = person.get("email")
+                            title = person.get("title", "Unknown")
+                            logging.info(f"      -> Success! Found validated decision-maker email: {found_email} ({title})")
+                            break
+                        
+                if found_email:
+                    if existing_email:
+                        if found_email not in existing_email:
+                            p["Contact"] = f"{existing_email}, {found_email}"
+                    else:
+                        p["Contact"] = found_email
+                        
+                    p["Email"] = p["Contact"]
+                    p["_apollo_enriched"] = True
+                    cache[domain] = {"email": found_email, "status": "success"}
                 else:
-                    p["Contact"] = found_email
-                    
-                p["Email"] = p["Contact"]
-                p["_apollo_enriched"] = True
-                cache[domain] = {"email": found_email, "status": "success"}
-                
+                    p["_apollo_enriched"] = False
+                    cache[domain] = {"email": None, "status": "no_email_found"}
+                    logging.info(f"      -> Apollo returned no valid decision-makers/emails for {domain}")
+            
             else:
                 p["_apollo_enriched"] = False
-                cache[domain] = {"email": None, "status": "no_email_found"}
-                logging.info(f"      -> Apollo returned no valid decision-makers/emails for {domain}")
+                logging.error(f"      -> Apollo API returned error status: {response.status_code} - {response.text}")
+                cache[domain] = {"email": None, "status": f"error_{response.status_code}"}
                 
             save_cache(cache)
             time.sleep(1.5) # Soft delay for rate limits
             
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             logging.error(f"      -> Error calling Apollo API for {domain}: {e}")
             cache[domain] = {"email": None, "status": "error"}
             save_cache(cache)

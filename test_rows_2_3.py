@@ -9,6 +9,7 @@ from googleapiclient.discovery import build
 
 from modules.module_2_research import run_traffic, run_backlinks, run_analysis
 from modules.module_4_outreach import run_outreach
+from modules.module_6_apollo import run_apollo_enrichment
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -43,11 +44,12 @@ def main():
     logging.info(f"Testing these exact domains: {[p['Domain'] for p in prospects]}")
     
     # Force delete cache for these 2 domains to guarantee fresh accurate data pull for the test
-    # Delete from both M2 and M4 cache to ensure complete fresh run
+    # Delete from M2, M4, and M6 cache to ensure complete fresh run
     m2_cache_file = 'data/module_2_cache.json'
     m4_cache_file = 'data/module_4_cache.json'
+    m6_cache_file = 'data/module_6_apollo_cache.json'
     
-    for cache_file in [m2_cache_file, m4_cache_file]:
+    for cache_file in [m2_cache_file, m4_cache_file, m6_cache_file]:
         if os.path.exists(cache_file):
             with open(cache_file, 'r') as f:
                 try:
@@ -183,6 +185,10 @@ def main():
         client_profile = json.load(f)
     logging.info("Executing M4 - Outreach Assembly...")
     prospects = run_outreach(prospects, client_profile)
+
+    # Module 6
+    logging.info("Executing M6 - Apollo Enrichment...")
+    prospects = run_apollo_enrichment(prospects)
 
     # 3. Write securely back to Row 2 and Row 3 (B:P)
     for i, p in enumerate(prospects):
