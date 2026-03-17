@@ -15,10 +15,14 @@ def load_json(filepath):
         # Gracefully handle empty or malformed cache
         try:
             with open(filepath, 'r') as f:
-                return json.load(f)
+                data = json.load(f)
+                if data.get("_version") != "v2":
+                    logging.info("Old cache version detected. Resetting to v2.")
+                    return {"_version": "v2"}
+                return data
         except Exception:
-            return {}
-    return {}
+            return {"_version": "v2"}
+    return {"_version": "v2"}
 
 def save_json(data, filepath):
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -40,12 +44,16 @@ def initialize_empty(domain_name, url=""):
         "Phase 2 - Traffic Volume": None,
         "Phase 3 - Inbound Ratios": None,
         "Phase 3 - Spam Score": None,
-        "Time Taken (Seconds)": 0,
+        "time_taken": 0,
         "Total Cost (USD)": "$0.00000",
         "Cost Breakdown": "DataForSEO Backlinks: $0.00 | DataForSEO Traffic: $0.00 | Gemini: Free",
         "_p2_rank": None,
         "_cost_bl": 0.0,
-        "_cost_tr": 0.0
+        "_cost_tr": 0.0,
+        "_traffic_done": False,
+        "_backlinks_done": False,
+        "_gemini_done": False,
+        "_fully_processed": False
     }
 
 def get_seo_headers():
@@ -78,9 +86,8 @@ def run_traffic(domains):
             cache[d_name] = initialize_empty(d_name, url)
             row = cache[d_name]
             
-        traffic_status = row.get("Phase 2 - Traffic Volume")
-        # Retry logic for failed pings
-        if traffic_status is None:
+        # Retry logic for failed pings based strictly on flags
+        if not row.get("_traffic_done"):
              to_query.append(d_name)
              
     if to_query:
@@ -110,6 +117,8 @@ def run_traffic(domains):
             except Exception as e:
                 logging.error(f"Traffic failed for {d_name}: {e}")
                 cache[d_name]["Phase 2 - Traffic Volume"] = None
+            finally:
+                cache[d_name]["_traffic_done"] = True
                 
         save_json(cache, CACHE_FILE)
         
@@ -119,6 +128,9 @@ def run_traffic(domains):
         obj = cache.get(d_name)
         if obj:
             _update_costs(obj)
+            # HARD RULE: Preserve incoming metadata (like _row_num)
+            if isinstance(d, dict):
+                obj.update({k: v for k, v in d.items() if k not in obj or obj[k] is None})
             out.append(obj)
     return out
 
@@ -133,7 +145,7 @@ def run_backlinks(domains):
         # dom is already an enriched object dict from run_traffic if running full pipeline
         d_name = dom.get("Domain", dom.get("domain", ""))
         row = cache.get(d_name)
-        if row and row.get("_p2_rank") is None:
+        if row and not row.get("_backlinks_done"):
              to_query.append(d_name)
              
     if to_query:
@@ -179,6 +191,8 @@ def run_backlinks(domains):
                 cache[d_name]["Phase 3 - Spam Score"] = None
                 cache[d_name]["Phase 2 - Geography"] = None
                 cache[d_name]["Phase 3 - Inbound Ratios"] = None
+            finally:
+                cache[d_name]["_backlinks_done"] = True
                 
         save_json(cache, CACHE_FILE)
 
@@ -188,6 +202,8 @@ def run_backlinks(domains):
         obj = cache.get(d_name)
         if obj:
             _update_costs(obj)
+            # HARD RULE: Preserve incoming metadata (like _row_num)
+            obj.update({k: v for k, v in d.items() if k not in obj or obj[k] is None})
             out.append(obj)
     return out
 
@@ -209,9 +225,12 @@ def run_analysis(domains):
         row = cache.get(d_name)
         if not row: continue # Should theoretically never happen due to pipeline flow
         
+        if row.get("_gemini_done"):
+            continue
+            
         # Scrape and Analysis
         clean_text = ""
-        if row.get("Phase 1 - Write for Us Red Flags") is None or row.get("Contact") is None:
+        if row.get("Contact") is None:
             try:
                 headers = {'User-Agent': 'Mozilla/5.0'}
                 req_url = url if str(url).startswith('http') else 'https://' + url
@@ -276,6 +295,8 @@ def run_analysis(domains):
                 row["Phase 1 - Topical Match"] = None
                 row["Quality Score (Phase 1 & 2)"] = None
                 
+        row["_gemini_done"] = True
+        
         # No longer concatenating PBN/Content Quality into Quality Score since Gemini generates it natively
         
         save_json(cache, CACHE_FILE)
@@ -286,5 +307,7 @@ def run_analysis(domains):
         obj = cache.get(d_name)
         if obj:
             _update_costs(obj)
+            # HARD RULE: Preserve incoming metadata (like _row_num)
+            obj.update({k: v for k, v in d.items() if k not in obj or obj[k] is None})
             out.append(obj)
     return out
