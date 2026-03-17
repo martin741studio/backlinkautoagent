@@ -10,6 +10,7 @@ from googleapiclient.discovery import build
 from modules.url_sanitizer import normalize_domain_url
 from modules.module_1_prospecting import run_module_1
 from modules.module_2_research import run_traffic, run_backlinks, run_analysis, load_json, save_json, CACHE_FILE
+from modules.module_4_outreach import run_outreach
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -24,29 +25,31 @@ def main():
     service = build('sheets', 'v4', credentials=creds)
     sheet = service.spreadsheets()
 
-    # 2. Read Column A
-    result = sheet.values().get(spreadsheetId=sheet_id, range="Sheet1!A:A").execute()
+    # 2. Read Column A:M to capture verdict (Column M is index 12)
+    result = sheet.values().get(spreadsheetId=sheet_id, range="Sheet1!A:M").execute()
     rows = result.get('values', [])
     
     headers = rows[0] if rows else ["URL (Domain)"]
-    existing_urls = []
+    existing_data = [] # tuple (url, verdict)
     for r in rows[1:]:
         if r and r[0].strip():
-            existing_urls.append(r[0].strip())
+            url = r[0].strip()
+            v = r[12].strip() if len(r) > 12 else None
+            existing_data.append((url, v))
             
-    # Normalize existing existing_urls
+    # Normalize existing URLs
     normalized_list = []
     seen = set()
     updates = []
     
     # Clean up Column A
-    for i, raw_url in enumerate(existing_urls):
+    for i, (raw_url, v) in enumerate(existing_data):
         row_num = i + 2
         norm = normalize_domain_url(raw_url)
         
         if norm != "INVALID_URL" and norm not in seen:
             seen.add(norm)
-            normalized_list.append((row_num, norm))
+            normalized_list.append((row_num, norm, v))
             if norm != raw_url:
                 updates.append({"range": f"Sheet1!A{row_num}", "values": [[norm]]})
                 
@@ -91,7 +94,7 @@ def main():
             ).execute()
             
             # Since rows could be padded, let's just re-fetch to safely grab the newly appended row numbers
-            result_new = sheet.values().get(spreadsheetId=sheet_id, range="Sheet1!A:A").execute()
+            result_new = sheet.values().get(spreadsheetId=sheet_id, range="Sheet1!A:M").execute()
             rows_new = result_new.get('values', [])
             
             normalized_list = []
@@ -99,17 +102,18 @@ def main():
             for i, r in enumerate(rows_new[1:]):
                 if r and r[0].strip():
                     url = r[0].strip()
+                    v = r[12].strip() if len(r) > 12 else None
                     seen.add(url)
-                    normalized_list.append((i + 2, url))
+                    normalized_list.append((i + 2, url, v))
             
             logging.info(f"Successfully populated prospects up to Row 15.")
             
     # Process rows 4 to 15 strictly
     targets = []
-    for r_num, url in normalized_list:
+    for r_num, url, v in normalized_list:
         if 4 <= r_num <= 15:
             domain_only = urllib.parse.urlparse(url).netloc
-            targets.append({"Domain": domain_only, "URL (Domain)": url, "_row_num": r_num})
+            targets.append({"Domain": domain_only, "URL (Domain)": url, "_row_num": r_num, "sheet_verdict": v})
             
     if not targets:
         logging.info("No targets found between row 4 and 15.")
@@ -146,83 +150,17 @@ def main():
                 except:
                     p["Quality Score (Phase 1 & 2)"] = None
                     
-        return p
+        # --- Update Costs ---
+        total_seo = p.get("_cost_bl", 0.0) + p.get("_cost_tr", 0.0)
+        p["Total Cost (USD)"] = f"${total_seo:.5f}"
+        p["Cost Breakdown"] = f"DataForSEO Backlinks: ${p.get('_cost_bl', 0.0):.5f} | DataForSEO Traffic: ${p.get('_cost_tr', 0.0):.5f} | Gemini: Unknown/Free"
         
-    processed_targets = []
-    
-    cache_data = load_json(CACHE_FILE)
-    
-    FORCE_REFRESH = False
-    
-    for p in targets:
-        if "_row_num" not in p:
-            raise ValueError(f"Missing _row_num in object: {p}")
-            
-        d_name = p['Domain']
-        cached_p = cache_data.get(d_name, {})
-        
-        # Merge cached into p safely without overwriting row_num (ensures _traffic_done etc are restored)
-        p.update({k: v for k, v in cached_p.items() if k not in p or p[k] is None})
-            
-        if p.get("_fully_processed") and not FORCE_REFRESH:
-            logging.info(f"⏭️ HARD SKIP Row {p['_row_num']} ({p['Domain']}) → Fully processed")
-            p = normalize_output_format(p)
-            processed_targets.append(p)
-            continue
-            
-        logging.info(f"Processing object for Row {p['_row_num']}: {p['Domain']}")
-        
-        row_start = time.time()
-        
-        # --- Research Processing ---
-        if not p.get("_traffic_done"):
-            p = run_traffic([p])[0]
-        else:
-            logging.info(f"Skipping Traffic → already completed")
-
-        if not p.get("_backlinks_done"):
-            p = run_backlinks([p])[0]
-        else:
-            logging.info(f"Skipping Backlinks → already completed")
-
-        if p.get("_gemini_done"):
-            logging.info(f"Skipping Gemini → already completed")
-        else:
-            # Failsafe applied natively since we skip anyway, but double enforcing
-            p = run_analysis([p])[0]
-        
-        row_end = time.time()
-        
-        p["time_taken"] = round(row_end - row_start, 2)
-        
-        p["_fully_processed"] = True
-        
-        # Manually lock final processing logic back into Cache directly
-        cache_data[d_name].update(p)
-        save_json(cache_data, CACHE_FILE)
-        
-        # Apply strict normalization to fix broken cached formats
-        p = normalize_output_format(p)
-        
-        processed_targets.append(p)
-        
-    targets = processed_targets
-    
-    # Final Database Write
-    update_data = []
-    for p in targets:
-        row_num = p["_row_num"]
-        
-        tf = p.get("Phase 2 - Traffic Volume")
-        spam = p.get("Phase 3 - Spam Score")
-
+        # --- Compute Verdict and Score ---
+        signals_dict = {}
         red_flag_text = p.get("Phase 1 - Write for Us Red Flags")
         topic_text = p.get("Phase 1 - Topical Match")
-        geo_text = p.get("Phase 2 - Geography")
         inbound_text = p.get("Phase 3 - Inbound Ratios")
-
-        signals_dict = {}
-
+        
         if red_flag_text:
             if "🔴" in red_flag_text: signals_dict["red_flags_status"] = "RED"
             elif "🟢" in red_flag_text: signals_dict["red_flags_status"] = "GREEN"
@@ -231,25 +169,20 @@ def main():
             if "🔴" in topic_text: signals_dict["topical_status"] = "RED"
             elif "🟢" in topic_text: signals_dict["topical_status"] = "GREEN"
 
-        if geo_text:
-            if "🔴" in geo_text: signals_dict["geo_status"] = "RED"
-            elif "🟢" in geo_text: signals_dict["geo_status"] = "GREEN"
+        geo_val = p.get("Phase 2 - Geography")
+        if geo_val:
+            if "🔴" in geo_val: signals_dict["geo_status"] = "RED"
+            elif "🟢" in geo_val: signals_dict["geo_status"] = "GREEN"
 
         if inbound_text:
             if "🔴" in inbound_text: signals_dict["inbound_status"] = "RED"
             elif "🟢" in inbound_text: signals_dict["inbound_status"] = "GREEN"
-
-        spam_val_str = None
-        if spam is not None:
-            if spam <= 30:
-                signals_dict["spam_status"] = "GREEN"
-                spam_val_str = "🟢"
-            elif spam <= 60:
-                signals_dict["spam_status"] = "YELLOW"
-                spam_val_str = "🟡"
-            else:
-                signals_dict["spam_status"] = "RED"
-                spam_val_str = "🔴"
+            
+        if p.get("Phase 3 - Spam Score") is not None:
+            sp = p["Phase 3 - Spam Score"]
+            if sp <= 30: signals_dict["spam_status"] = "GREEN"
+            elif sp <= 60: signals_dict["spam_status"] = "YELLOW"
+            else: signals_dict["spam_status"] = "RED"
             
         signals_full = [
             signals_dict.get("red_flags_status"),
@@ -277,15 +210,110 @@ def main():
             score = min(score, 60)
             
         score = max(0, min(100, int(score)))
+        p["score"] = score
         
-        signals = present_signals
-
-        if "RED" in signals:
-            verdict = "🔴 REJECTED"
-        elif "YELLOW" in signals:
-            verdict = "🟡 REVIEW"
+        # Fetch highest precedence priority: The actual physical label in the Google Sheet right now
+        sv = p.get("sheet_verdict")
+        if sv in ["🟢 APPROVED", "🟡 REVIEW", "🔴 REJECTED"]:
+            p["verdict"] = sv
+        elif "verdict" not in p or p["verdict"] not in ["🟢 APPROVED", "🟡 REVIEW", "🔴 REJECTED"]:
+            if "RED" in present_signals:
+                p["verdict"] = "🔴 REJECTED"
+            elif "YELLOW" in present_signals:
+                p["verdict"] = "🟡 REVIEW"
+            else:
+                p["verdict"] = "🟢 APPROVED"
+            
+        return p
+        
+    processed_targets = []
+    
+    cache_data = load_json(CACHE_FILE)
+    
+    FORCE_REFRESH = False
+    
+    for p in targets:
+        if "_row_num" not in p:
+            raise ValueError(f"Missing _row_num in object: {p}")
+            
+        d_name = p['Domain']
+        cached_p = cache_data.get(d_name, {})
+        
+        # Merge cached into p safely without overwriting row_num (ensures _traffic_done etc are restored)
+        p.update({k: v for k, v in cached_p.items() if k not in p or p[k] is None})
+            
+        if p.get("_fully_processed") and not FORCE_REFRESH:
+            # We still normalize to ensure cost formats, etc., are up to date
+            p = normalize_output_format(p)
+            logging.info(f"⏭️ HARD SKIP Row {p['_row_num']} ({p['Domain']}) → Fully processed ({p.get('verdict')})")
+            processed_targets.append(p)
+            continue
+            
+        logging.info(f"Processing object for Row {p['_row_num']}: {p['Domain']}")
+        
+        row_start = time.time()
+        
+        # --- Research Processing ---
+        if not p.get("_traffic_done"):
+            p = run_traffic([p])[0]
         else:
-            verdict = "🟢 APPROVED"
+            logging.info(f"Skipping Traffic → already completed")
+
+        if not p.get("_backlinks_done"):
+            p = run_backlinks([p])[0]
+        else:
+            logging.info(f"Skipping Backlinks → already completed")
+
+        if p.get("_gemini_done"):
+            logging.info(f"Skipping Gemini → already completed")
+        else:
+            # Failsafe applied natively since we skip anyway, but double enforcing
+            p = run_analysis([p])[0]
+        
+        row_end = time.time()
+        
+        # Accumulate time rather than replacing, so we don't wipe historical metrics when modules skip
+        p["time_taken"] = round(p.get("time_taken", 0) + (row_end - row_start), 2)
+        
+        p["_fully_processed"] = True
+        
+        # Manually lock final processing logic back into Cache directly
+        cache_data[d_name].update(p)
+        save_json(cache_data, CACHE_FILE)
+        
+        # Apply strict normalization to fix broken cached formats
+        p = normalize_output_format(p)
+        
+        processed_targets.append(p)
+        
+    targets = processed_targets
+    
+    # Load client profile for Outreach
+    client_profile_path = "config/client_profile_template.json"
+    client_profile = {}
+    if os.path.exists(client_profile_path):
+        with open(client_profile_path, 'r') as f:
+            client_profile = json.load(f)
+            
+    # Execute Outreach Module 4
+    targets = run_outreach(targets, client_profile)
+    
+    # Final Database Write
+    update_data = []
+    for p in targets:
+        row_num = p["_row_num"]
+        
+        tf = p.get("Phase 2 - Traffic Volume")
+        spam = p.get("Phase 3 - Spam Score")
+        red_flag_text = p.get("Phase 1 - Write for Us Red Flags")
+        topic_text = p.get("Phase 1 - Topical Match")
+        geo_text = p.get("Phase 2 - Geography")
+        inbound_text = p.get("Phase 3 - Inbound Ratios")
+        spam_val_str = None
+        if spam is not None:
+            if spam <= 30: spam_val_str = "🟢"
+            elif spam <= 60: spam_val_str = "🟡"
+            else: spam_val_str = "🔴"
 
         def safe_val(v):
             if v is None: return None
@@ -304,12 +332,14 @@ def main():
             p.get("time_taken", 0), # J
             safe_val(p.get("Total Cost (USD)")), # K
             safe_val(p.get("Cost Breakdown")), # L
-            verdict, # M
-            score # N
+            p.get("verdict"), # M
+            p.get("score"), # N
+            safe_val(p.get("Outreach Subject")), # O
+            safe_val(p.get("Outreach Body")) # P
         ]
         
         update_data.append({
-            "range": f"Sheet1!B{row_num}:N{row_num}",
+            "range": f"Sheet1!B{row_num}:P{row_num}",
             "values": [values]
         })
 
